@@ -54,6 +54,12 @@ typedef struct {
     uint32_t write_descriptor_length;
     uint32_t validate_descriptor_count;
     uint32_t validate_descriptor_length;
+    uint32_t initial_table_index;
+    uint32_t initial_table_count;
+    uint32_t flash_only_table_index;
+    uint32_t flash_only_table_count;
+    uint32_t final_table_index;
+    uint32_t final_table_count;
     uint16_t ff_major;
     uint16_t ff_minor;
     char platform[193];
@@ -71,6 +77,7 @@ typedef struct {
     uint32_t entry_count;
     uint32_t entry_size;
     uint32_t entries_crc;
+    int header_crc_valid;
 } GPTHeader;
 
 static uint16_t le16(const unsigned char *p) {
@@ -180,13 +187,6 @@ static void free_info(FFUInfo *info) {
     memset(info, 0, sizeof(*info));
 }
 
-static int has_end_location(const WriteDescriptor *d) {
-    uint32_t i;
-    for (i = 0; i < d->location_count; ++i)
-        if (d->locations[i].method == 2) return 1;
-    return 0;
-}
-
 static int parse_ffu(FILE *in, FFUInfo *info) {
     unsigned char h[STORE_HEADER_SIZE];
     unsigned char sec[SECURITY_HEADER_MIN];
@@ -234,9 +234,26 @@ static int parse_ffu(FILE *in, FFUInfo *info) {
     }
 
     image_start = security_region;
-    if (read_at(in, image_start, img, sizeof(img)) != 0 ||
-        memcmp(img + 4, "ImageFlash ", 12) != 0) {
-        fprintf(stderr, "error: invalid or truncated FFU image header\n");
+    if (read_at(in, image_start, img, sizeof(img)) != 0) {
+        fprintf(stderr,
+                "error: truncated FFU image header at offset 0x%" PRIx64
+                " (file size 0x%" PRIx64 ")\n",
+                image_start, file_len);
+        return -1;
+    }
+    /* The fixed-width field is 12 bytes, but the visible signature text
+       "ImageFlash " is 11 bytes. Do not require a particular value for the
+       twelfth padding byte; some producers do not NUL-terminate it. */
+    if (memcmp(img + 4, "ImageFlash ", 11) != 0) {
+        unsigned int j;
+        fprintf(stderr,
+                "error: ImageFlash signature not found at computed offset "
+                "0x%" PRIx64 " (security header=%u, catalog=%u, hash=%u, "
+                "chunk alignment=%u). Bytes at candidate: ",
+                image_start, sec_cb, catalog_size, hash_size,
+                info->chunk_alignment);
+        for (j = 0; j < 12; ++j) fprintf(stderr, "%02X%s", img[4 + j], j == 11 ? "" : " ");
+        fputc('\n', stderr);
         return -1;
     }
     image_cb = le32(img + 0);
@@ -269,6 +286,12 @@ static int parse_ffu(FILE *in, FFUInfo *info) {
     info->write_descriptor_length = le32(h + 212);
     info->validate_descriptor_count = le32(h + 216);
     info->validate_descriptor_length = le32(h + 220);
+    info->initial_table_index = le32(h + 224);
+    info->initial_table_count = le32(h + 228);
+    info->flash_only_table_index = le32(h + 232);
+    info->flash_only_table_count = le32(h + 236);
+    info->final_table_index = le32(h + 240);
+    info->final_table_count = le32(h + 244);
 
     if (info->block_size < 512 || info->block_size > (1024u * 1024u) ||
         (info->block_size & (info->block_size - 1u)) != 0) {
@@ -379,6 +402,10 @@ static int parse_ffu(FILE *in, FFUInfo *info) {
     printf("FFU version  : %u.%u\n", info->ff_major, info->ff_minor);
     printf("Block size   : %u bytes\n", info->block_size);
     printf("Descriptors  : %u\n", info->write_descriptor_count);
+    printf("GPT payloads : initial=%u+%u flash-only=%u+%u final=%u+%u blocks\n",
+           info->initial_table_index, info->initial_table_count,
+           info->flash_only_table_index, info->flash_only_table_count,
+           info->final_table_index, info->final_table_count);
     printf("Payload at   : 0x%" PRIx64 "\n", info->payload_offset);
     return 0;
 }
@@ -430,7 +457,16 @@ static int write_descriptor(FILE *in, FILE *out, const WriteDescriptor *d,
         if (r != 0) return r;
         if (add_u64(out_offset, d->data_size, &out_end) != 0 ||
             (disk_bytes && out_end > disk_bytes)) {
-            fprintf(stderr, "error: descriptor destination range exceeds disk bounds\n");
+            fprintf(stderr,
+                    "error: descriptor destination range exceeds disk bounds: "
+                    "method=%u block_index=0x%08" PRIx32 " (%" PRId32 "), "
+                    "target=0x%" PRIx64 ", data=0x%" PRIx64 ", "
+                    "end=0x%" PRIx64 ", disk=0x%" PRIx64 ", "
+                    "descriptor_blocks=%" PRIu32 " block_size=%" PRIu32 "\n",
+                    loc->method, loc->block_index, (int32_t)loc->block_index,
+                    out_offset, d->data_size,
+                    add_u64(out_offset, d->data_size, &out_end) == 0 ? out_end : UINT64_MAX,
+                    disk_bytes, d->block_count, block_size);
             return -1;
         }
         if (copy_input_to_output(in, d->data_offset, out, out_offset, d->data_size,
@@ -440,6 +476,80 @@ static int write_descriptor(FILE *in, FILE *out, const WriteDescriptor *d,
             return -1;
         }
         if (actual_end && out_end > *actual_end) *actual_end = out_end;
+    }
+    return 0;
+}
+
+typedef struct {
+    int known;
+    uint64_t offset;
+} ProbeCursor;
+
+static int apply_signed_delta(uint64_t base, int64_t delta, uint64_t *result) {
+    if (delta < 0) {
+        /* Avoid negating INT64_MIN directly. */
+        uint64_t magnitude = (uint64_t)(-(delta + 1)) + 1u;
+        if (base < magnitude) return -1;
+        *result = base - magnitude;
+    } else {
+        if (base > UINT64_MAX - (uint64_t)delta) return -1;
+        *result = base + (uint64_t)delta;
+    }
+    return 0;
+}
+
+/*
+ * First pass: write only destinations that can be resolved without knowing
+ * the disk size. DISK_END locations are skipped, but later descriptors are
+ * still visited because FFU descriptor order follows payload order, not disk
+ * LBA order. A DISK_SEQ location after an unresolved DISK_END is also skipped
+ * until a DISK_BEGIN location re-establishes a known cursor. This pass is only
+ * used to discover the final primary GPT and disk size; the image is cleared
+ * and replayed in full after disk_bytes has been determined.
+ */
+static int probe_write_descriptor(FILE *in, FILE *out, const WriteDescriptor *d,
+                                  uint32_t block_size, ProbeCursor *cursor,
+                                  int *skipped_unresolved) {
+    uint32_t i;
+
+    for (i = 0; i < d->location_count; ++i) {
+        const DiskLocation *loc = &d->locations[i];
+        uint64_t target = 0, target_end;
+        int target_known = 1;
+
+        if (loc->method == 0) { /* DISK_BEGIN */
+            if (mul_u64(loc->block_index, block_size, &target) != 0) return -1;
+        } else if (loc->method == 1) { /* DISK_SEQ */
+            int64_t index = (int32_t)loc->block_index;
+            int64_t delta;
+            if (index > INT64_MAX / (int64_t)block_size ||
+                index < INT64_MIN / (int64_t)block_size) return -1;
+            delta = index * (int64_t)block_size;
+            if (!cursor->known) {
+                target_known = 0;
+                *skipped_unresolved = 1;
+            } else if (apply_signed_delta(cursor->offset, delta, &target) != 0) {
+                return -1;
+            }
+        } else if (loc->method == 2) { /* DISK_END */
+            target_known = 0;
+            cursor->known = 0;
+            *skipped_unresolved = 1;
+        } else {
+            return -1;
+        }
+
+        if (!target_known) continue;
+        if (add_u64(target, d->data_size, &target_end) != 0) return -1;
+        if (copy_input_to_output(in, d->data_offset, out, target,
+                                 d->data_size, 0) != 0) {
+            fprintf(stderr,
+                    "error: failed writing probe data for destination offset 0x%" PRIx64 "\n",
+                    target);
+            return -1;
+        }
+        cursor->known = 1;
+        cursor->offset = target_end;
     }
     return 0;
 }
@@ -503,10 +613,13 @@ static int read_gpt_header(FILE *disk, GPTHeader *gpt, int print_errors) {
             memcpy(copy, block, gpt->header_size);
             memset(copy + 16, 0, 4);
             computed_crc = crc32_ieee(copy, gpt->header_size);
-            if (computed_crc != stored_crc)
+            gpt->header_crc_valid = (computed_crc == stored_crc);
+            if (!gpt->header_crc_valid)
                 fprintf(stderr, "warning: GPT header CRC mismatch (stored %08x, computed %08x)\n",
                         stored_crc, computed_crc);
             free(copy);
+        } else {
+            gpt->header_crc_valid = 0;
         }
     }
     if (gpt->alternate_lba == UINT64_MAX ||
@@ -517,6 +630,99 @@ static int read_gpt_header(FILE *disk, GPTHeader *gpt, int print_errors) {
     }
     free(block);
     return 0;
+}
+
+static int parse_gpt_header_sector(const unsigned char *sector, uint32_t sector_size,
+                                   GPTHeader *gpt) {
+    unsigned char copy[GPT_MAX_ENTRY_SIZE];
+    uint32_t header_size, stored_crc, computed_crc;
+
+    if (sector_size < GPT_MIN_HEADER_SIZE || sector_size > sizeof(copy) ||
+        memcmp(sector, "EFI PART", 8) != 0) return -1;
+    header_size = le32(sector + 12);
+    if (header_size < GPT_MIN_HEADER_SIZE || header_size > sector_size ||
+        le64(sector + 24) != 1 || le64(sector + 32) < 2) return -1;
+
+    memcpy(copy, sector, header_size);
+    stored_crc = le32(copy + 16);
+    memset(copy + 16, 0, 4);
+    computed_crc = crc32_ieee(copy, header_size);
+    if (computed_crc != stored_crc) return -1;
+
+    memset(gpt, 0, sizeof(*gpt));
+    gpt->sector_size = sector_size;
+    gpt->header_size = header_size;
+    gpt->alternate_lba = le64(sector + 32);
+    gpt->entries_lba = le64(sector + 72);
+    gpt->entry_count = le32(sector + 80);
+    gpt->entry_size = le32(sector + 84);
+    gpt->entries_crc = le32(sector + 88);
+    if (add_u64(gpt->alternate_lba, 1, &gpt->total_blocks) != 0) return -1;
+    gpt->header_crc_valid = 1;
+    return 0;
+}
+
+/*
+ * The Store Header records the payload block range containing the final GPT.
+ * Prefer that authoritative table over a GPT left in the probe image: the
+ * probe may contain an intentionally transitional/invalid GPT if writes using
+ * DISK_END or DISK_SEQ could not be resolved yet.
+ */
+static int read_final_gpt_from_payload(FILE *in, const FFUInfo *info,
+                                       GPTHeader *gpt, uint64_t *payload_block_out) {
+    static const uint32_t candidates[] = {512u, 4096u, 1024u, 2048u};
+    unsigned char *block = NULL;
+    uint64_t total_payload_blocks = 0, wanted_end;
+    uint64_t descriptor_first_block = 0;
+    uint32_t i;
+
+    if (info->final_table_count == 0 ||
+        add_u64(info->final_table_index, info->final_table_count, &wanted_end) != 0)
+        return -1;
+    for (i = 0; i < info->write_descriptor_count; ++i) {
+        if (add_u64(total_payload_blocks, info->descriptors[i].block_count,
+                    &total_payload_blocks) != 0) return -1;
+    }
+    if (wanted_end > total_payload_blocks) return -1;
+
+    block = (unsigned char *)malloc(info->block_size);
+    if (!block) return -1;
+    for (i = 0; i < info->write_descriptor_count; ++i) {
+        const WriteDescriptor *d = &info->descriptors[i];
+        uint64_t descriptor_end, first, last, payload_index;
+        if (add_u64(descriptor_first_block, d->block_count, &descriptor_end) != 0) {
+            free(block);
+            return -1;
+        }
+        first = descriptor_first_block > info->final_table_index
+                    ? descriptor_first_block : info->final_table_index;
+        last = descriptor_end < wanted_end ? descriptor_end : wanted_end;
+        for (payload_index = first; payload_index < last; ++payload_index) {
+            uint64_t file_offset;
+            size_t c;
+            if (mul_u64(payload_index - descriptor_first_block,
+                        info->block_size, &file_offset) != 0 ||
+                add_u64(d->data_offset, file_offset, &file_offset) != 0 ||
+                read_at(in, file_offset, block, info->block_size) != 0) {
+                free(block);
+                return -1;
+            }
+            for (c = 0; c < sizeof(candidates) / sizeof(candidates[0]); ++c) {
+                uint32_t sector_size = candidates[c];
+                if ((uint64_t)sector_size + GPT_MIN_HEADER_SIZE > info->block_size)
+                    continue;
+                if (parse_gpt_header_sector(block + sector_size, sector_size, gpt) == 0) {
+                    if (payload_block_out) *payload_block_out = payload_index;
+                    free(block);
+                    return 0;
+                }
+            }
+        }
+        descriptor_first_block = descriptor_end;
+        if (descriptor_first_block >= wanted_end) break;
+    }
+    free(block);
+    return -1;
 }
 
 static void guid_to_string(const unsigned char *g, char out[37]) {
@@ -714,24 +920,84 @@ done:
 
 static int convert_ffu(FILE *in, FILE *out, const FFUInfo *info,
                        int do_split, const char *split_dir) {
-    uint32_t first_deferred = info->write_descriptor_count;
     uint32_t i;
-    uint64_t cursor_before_deferred = 0, actual_end = 0, disk_bytes = 0;
-    GPTHeader gpt;
-    int have_gpt = 0;
+    uint64_t disk_bytes = 0, current_size = 0;
+    GPTHeader gpt, final_gpt;
+    ProbeCursor cursor = { 1, 0 };
+    int skipped_unresolved = 0;
 
+    /* Pass 1: best-effort reconstruction of destinations not depending on
+       the unknown end of disk. Do not stop at the first DISK_END descriptor. */
     for (i = 0; i < info->write_descriptor_count; ++i) {
-        if (has_end_location(&info->descriptors[i])) {
-            first_deferred = i;
-            if (tell64(out, &cursor_before_deferred) != 0) {
-                fprintf(stderr, "error: cannot get output cursor\n");
+        if (probe_write_descriptor(in, out, &info->descriptors[i],
+                                   info->block_size, &cursor,
+                                   &skipped_unresolved) != 0) {
+            fprintf(stderr, "error: failed probing descriptor %u\n", i);
+            return -1;
+        }
+    }
+    if (fflush(out) != 0) {
+        fprintf(stderr, "error: failed flushing probe image\n");
+        return -1;
+    }
+
+    {
+        uint64_t final_gpt_payload_block = 0;
+        GPTHeader payload_gpt;
+        if (read_final_gpt_from_payload(in, info, &payload_gpt,
+                                        &final_gpt_payload_block) == 0) {
+            gpt = payload_gpt;
+            printf("Disk size source: Store Header final-GPT payload block %" PRIu64
+                   " (CRC-validated)\n", final_gpt_payload_block);
+        } else {
+            if (read_gpt_header(out, &gpt, 0) != 0 || !gpt.header_crc_valid) {
+                fprintf(stderr,
+                        "error: cannot determine disk size safely: Store Header final-GPT payload "
+                        "could not be parsed, and probe image has no CRC-valid primary GPT%s\n",
+                        skipped_unresolved ? " (some DISK_END/DISK_SEQ writes were skipped)" : "");
                 return -1;
             }
-            break;
+            printf("Disk size source: CRC-validated primary GPT in probe image\n");
         }
+    }
+    if (mul_u64(gpt.total_blocks, gpt.sector_size, &disk_bytes) != 0 ||
+        disk_bytes == 0 || file_size(out, &current_size) != 0) {
+        fprintf(stderr, "error: GPT-declared disk size is invalid or probe output size unavailable\n");
+        return -1;
+    }
+
+    if (current_size > disk_bytes) {
+        fprintf(stderr,
+                "warning: probe image extent 0x%" PRIx64 " exceeds GPT disk size 0x%" PRIx64
+                "; probe may include unresolved/transitional writes; final replay will enforce GPT bounds\n",
+                current_size, disk_bytes);
+    }
+    printf("GPT: sector=%u alternate_lba=%" PRIu64 " total_blocks=%" PRIu64
+           " header_crc=%s\n",
+           gpt.sector_size, gpt.alternate_lba, gpt.total_blocks,
+           gpt.header_crc_valid ? "valid" : "INVALID/unchecked");
+    printf("Reconstructed disk size: %" PRIu64 " bytes (sector size %u; FFU block size %u)\n",
+           disk_bytes, gpt.sector_size, info->block_size);
+
+    /* Pass 2: discard the incomplete probe and replay every descriptor in its
+       original order, now that DISK_END can be resolved exactly. This also
+       restores the intended overwrite order between initial/final GPT blocks. */
+    if (set_file_size(out, 0) != 0 || set_file_size(out, disk_bytes) != 0 ||
+        seek64(out, 0) != 0) {
+        fprintf(stderr, "error: unable to initialize final disk image\n");
+        return -1;
+    }
+    for (i = 0; i < info->write_descriptor_count; ++i) {
         if (write_descriptor(in, out, &info->descriptors[i], info->block_size,
-                             0, 1, &actual_end) != 0) {
-            fprintf(stderr, "error: failed writing descriptor %u\n", i);
+                             disk_bytes, 1, NULL) != 0) {
+            fprintf(stderr,
+                    "error: failed replaying descriptor %u (locations=%" PRIu32
+                    ", blocks=%" PRIu32 ", payload=0x%" PRIx64
+                    "+0x%" PRIx64 ")\n",
+                    i, info->descriptors[i].location_count,
+                    info->descriptors[i].block_count,
+                    info->descriptors[i].data_offset,
+                    info->descriptors[i].data_size);
             return -1;
         }
     }
@@ -740,62 +1006,16 @@ static int convert_ffu(FILE *in, FILE *out, const FFUInfo *info,
         return -1;
     }
 
-    if (read_gpt_header(out, &gpt, 0) == 0) {
-        uint64_t current_size;
-        have_gpt = 1;
-        if (mul_u64(gpt.total_blocks, gpt.sector_size, &disk_bytes) != 0 ||
-            file_size(out, &current_size) != 0 || current_size > disk_bytes) {
-            fprintf(stderr, "error: GPT-declared disk size conflicts with written data\n");
-            return -1;
-        }
-    }
-
-    if (first_deferred < info->write_descriptor_count) {
-        if (!have_gpt) {
-            fprintf(stderr, "error: FFU contains DISK_END descriptors, but a valid primary GPT was not found; cannot resolve end-relative writes\n");
-            return -1;
-        }
-        if (set_file_size(out, disk_bytes) != 0 || fflush(out) != 0 ||
-            seek64(out, cursor_before_deferred) != 0) {
-            fprintf(stderr, "error: unable to size/position output image for DISK_END writes\n");
-            return -1;
-        }
-        for (i = first_deferred; i < info->write_descriptor_count; ++i) {
-            if (write_descriptor(in, out, &info->descriptors[i], info->block_size,
-                                 disk_bytes, 1, &actual_end) != 0) {
-                fprintf(stderr, "error: failed writing deferred descriptor %u\n", i);
-                return -1;
-            }
-        }
-    }
-
-    if (fflush(out) != 0) {
-        fprintf(stderr, "error: failed flushing output image\n");
+    /* Validate the result after applying the full ordered descriptor stream. */
+    if (read_gpt_header(out, &final_gpt, 1) != 0 ||
+        !final_gpt.header_crc_valid ||
+        final_gpt.total_blocks != gpt.total_blocks ||
+        final_gpt.sector_size != gpt.sector_size ||
+        set_file_size(out, disk_bytes) != 0) {
+        fprintf(stderr, "error: final replay did not preserve a CRC-valid primary GPT with the discovered disk size\n");
         return -1;
     }
-    if (!have_gpt) {
-        if (read_gpt_header(out, &gpt, 0) == 0 &&
-            mul_u64(gpt.total_blocks, gpt.sector_size, &disk_bytes) == 0) {
-            uint64_t current_size;
-            if (file_size(out, &current_size) == 0 && current_size <= disk_bytes) {
-                if (set_file_size(out, disk_bytes) != 0) {
-                    fprintf(stderr, "error: unable to extend sparse image to GPT disk size\n");
-                    return -1;
-                }
-                have_gpt = 1;
-            }
-        }
-    } else {
-        if (set_file_size(out, disk_bytes) != 0) {
-            fprintf(stderr, "error: unable to set final disk image size\n");
-            return -1;
-        }
-    }
     if (do_split) {
-        if (fflush(out) != 0 || !have_gpt) {
-            fprintf(stderr, "error: partition splitting requires a valid primary GPT\n");
-            return -1;
-        }
         if (split_partitions(out, split_dir) != 0) return -1;
     }
     return 0;
